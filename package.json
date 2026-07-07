@@ -4,11 +4,11 @@
   "description": "Cross-agent MCP Server SDK — works with Claude Code, Cursor, Mavis, and any HTTP-based AI agent via stdio or streamable-http transport",
   "main": "index.js",
   "type": "commonjs",
-  "author": "付饶",
+  "author": "dekaic",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/HappyLifeOk/universal-mcp-sdk.git"
+    "url": "https://github.com/dekaic/universal-mcp-sdk.git"
   },
   "engines": {
     "node": ">=16"

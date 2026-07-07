@@ -401,4 +401,4 @@ mcp-sdk/
 
 ## License
 
-Apache-2.0 — Copyright 2026 付饶. See [LICENSE](./LICENSE) for details.
+Apache-2.0 — Copyright 2026 dekaic. See [LICENSE](./LICENSE) for details.
