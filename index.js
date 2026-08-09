@@ -12,7 +12,6 @@
 const { createDispatcher } = require('./protocol/dispatcher');
 const { createStdioTransport } = require('./transport/stdio');
 const { createHttpTransport } = require('./transport/streamable-http');
-const { createHttpTransport: createHttpTransportAlias } = require('./transport/streamable-http');
 const { tool, command, tools } = require('./tool');
 const { defineResource, staticResource, dynamicResource, resources } = require('./resource');
 const { textContent, errorContent, imageContent, audioContent, imageContentFromFile, textLinesContent } = require('./protocol/content');
@@ -41,34 +40,6 @@ function detectMode() {
 
     // 默认：HTTP（多 Agent 通用，最灵活）
     return 'http';
-}
-
-// ── 端口检测（避免冲突）─────────────────────────────────────────
-function findAvailablePort(startPort = 8080, maxRetries = 20) {
-    return new Promise((resolve) => {
-        const net = require('net');
-        let port = startPort;
-        let retries = 0;
-
-        function tryPort() {
-            const sock = net.createConnection({ port, host: '127.0.0.1' });
-            sock.on('connect', () => {
-                sock.destroy();
-                if (retries < maxRetries) {
-                    port++;
-                    retries++;
-                    tryPort();
-                } else {
-                    resolve(startPort + 100);
-                }
-            });
-            sock.on('error', () => {
-                sock.destroy();
-                resolve(port);
-            });
-        }
-        tryPort();
-    });
 }
 
 // ── 配置生成 ────────────────────────────────────────────────────
@@ -139,30 +110,38 @@ function createServer(options) {
             stdioTransport = createStdioTransport(dispatcher);
             stdioTransport.start();
             console.log(`[mcp-sdk] stdio transport started (ready for Claude Code / Cursor)`);
+            return { mode: 'stdio' };
         } else {
-            // 解析 --port 命令行参数，优先级：--port argv > options.port > 自动探测
-            let startPort = options.port || 8080;
+            // 端口由真正的 HTTP server 原子绑定；port=0 交给操作系统分配，避免探测后再绑定的竞态。
+            let startPort = options.port !== undefined ? options.port : 8080;
             const portArgIdx = process.argv.indexOf('--port');
             if (portArgIdx !== -1 && process.argv[portArgIdx + 1]) {
                 const parsed = parseInt(process.argv[portArgIdx + 1], 10);
                 if (!isNaN(parsed)) startPort = parsed;
             }
-            const port = await findAvailablePort(startPort);
             httpTransport = createHttpTransport(dispatcher, {
-                port,
+                port: startPort,
                 host: options.host || '127.0.0.1',
                 path: options.path || '/mcp',
                 protocolVersion: options.protocolVersion,
                 allowedOrigins: options.allowedOrigins,
+                authToken: options.authToken,
+                maxBodyBytes: options.maxBodyBytes,
             });
-            httpTransport.start();
+            try {
+                const address = await httpTransport.start();
+                return { mode: 'http', host: address.host, port: address.port, path: address.path };
+            } catch (error) {
+                httpTransport = null;
+                throw error;
+            }
         }
     }
 
     // ── stop() ──────────────────────────────────────────────────
-    function stop() {
+    async function stop() {
         if (httpTransport) {
-            httpTransport.stop();
+            await httpTransport.stop();
             httpTransport = null;
         }
     }
@@ -239,7 +218,7 @@ module.exports = {
     textLinesContent,
     // transport（供高级用法）
     createStdioTransport,
-    createHttpTransport: createHttpTransportAlias,
+    createHttpTransport,
     generateOpenAIResponsesTool,
     // 内部协议（供高级用法）
     createDispatcher,

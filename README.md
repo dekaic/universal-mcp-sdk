@@ -47,7 +47,7 @@ const server = createServer({
     ],
 });
 
-server.start();
+server.start().then(address => console.log('listening', address));
 ```
 
 直接 `node your-server.js` 启动时，SDK 会自动检测运行环境：
@@ -111,7 +111,7 @@ const server = createServer({
     ],
 });
 
-server.start();
+server.start().catch(console.error);
 ```
 
 ---
@@ -215,7 +215,9 @@ handler 直接返回 string / object 时，SDK 自动包成 text（见下方 API
 | `/mcp` | `GET` | 返回 server 信息 + 端点说明（**注意：握手 `initialize` 走 POST，不是这个 GET**） |
 | `/` | `GET` | 健康检查 `{status:"ok"}` |
 
-- 所有端点开 **CORS**（`Access-Control-Allow-Origin: *`），浏览器 / 跨域客户端可直连，`OPTIONS` 预检回 `204`
+- 默认拒绝带 `Origin` 的浏览器请求；只为 `allowedOrigins` 中的来源返回 CORS header
+- 配置 `authToken` 后，所有端点要求 `Authorization: Bearer <token>`
+- 请求体默认上限 1 MiB，只接受 `application/json`
 - **无 session、无 SSE**：每个 POST 是独立的请求 / 响应，接入方不需要维护 session id
 
 ---
@@ -290,6 +292,7 @@ ChatGPT Apps / Connectors 开发者模式里创建 connector 时，`Connector UR
 # 1) 握手 initialize（走 POST，不是 GET —— GET /mcp 只返回 server 信息）
 curl -X POST http://127.0.0.1:8080/mcp \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 
 # 2) 列工具
@@ -316,7 +319,10 @@ curl -X POST http://127.0.0.1:8080/mcp \
 | `tools` | Array | 否 | tool 定义列表 |
 | `resources` | Array | 否 | resource 定义列表 |
 | `customHandlers` | object | 否 | 自定义 JSON-RPC 方法 |
-| `port` | number | 否 | HTTP 模式端口，默认 8080 |
+| `port` | number | 否 | HTTP 模式端口，默认 8080；传 `0` 由操作系统原子分配 |
+| `authToken` | string | 否 | bearer token；配置后所有 HTTP endpoint 强制鉴权 |
+| `allowedOrigins` | string[] | 否 | 允许的浏览器 Origin；默认空数组（拒绝跨域浏览器请求） |
+| `maxBodyBytes` | number | 否 | HTTP 请求体上限，默认 1 MiB |
 | `entryPoint` | string | 否 | 用于生成配置文件的入口路径 |
 
 ### tool(name, description, inputSchema, handler)

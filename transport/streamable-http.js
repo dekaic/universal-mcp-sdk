@@ -14,22 +14,29 @@
 
 const http = require('http');
 const url = require('url');
+const crypto = require('crypto');
 
 const DEFAULT_PROTOCOL_VERSION = '2025-03-26';
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2025-03-26', '2025-06-18']);
 
 function createHttpTransport(dispatcher, options) {
     options = options || {};
-    const port = options.port || 8080;
+    const port = options.port !== undefined ? options.port : 8080;
     const host = options.host || '127.0.0.1';
     const path = options.path || '/mcp';
     const protocolVersion = options.protocolVersion || DEFAULT_PROTOCOL_VERSION;
-    const allowedOrigins = options.allowedOrigins || null;
+    const allowedOrigins = Array.isArray(options.allowedOrigins) ? options.allowedOrigins : [];
+    const authToken = options.authToken || '';
+    const maxBodyBytes = options.maxBodyBytes || 1024 * 1024;
 
     let server = null;
 
-    function setCommonHeaders(res) {
-        res.setHeader('Access-Control-Allow-Origin', '*');
+    function setCommonHeaders(req, res) {
+        const origin = req && req.headers && req.headers.origin;
+        if (origin && allowedOrigins.includes(origin)) {
+            res.setHeader('Access-Control-Allow-Origin', origin);
+            res.setHeader('Vary', 'Origin');
+        }
         res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', [
             'Authorization',
@@ -43,9 +50,9 @@ function createHttpTransport(dispatcher, options) {
     }
 
     // ── 发送 JSON-RPC 响应的辅助函数 ─────────────────────────────
-    function sendJson(res, statusCode, body) {
+    function sendJson(req, res, statusCode, body) {
         const data = JSON.stringify(body);
-        setCommonHeaders(res);
+        setCommonHeaders(req, res);
         res.writeHead(statusCode, {
             'Content-Type': 'application/json',
             'Content-Length': Buffer.byteLength(data),
@@ -53,25 +60,34 @@ function createHttpTransport(dispatcher, options) {
         res.end(data);
     }
 
-    function sendError(res, statusCode, code, message) {
-        sendJson(res, statusCode, {
+    function sendError(req, res, statusCode, code, message) {
+        sendJson(req, res, statusCode, {
             jsonrpc: '2.0',
             error: { code, message },
             id: null,
         });
     }
 
-    function sendAccepted(res) {
-        setCommonHeaders(res);
+    function sendAccepted(req, res) {
+        setCommonHeaders(req, res);
         res.writeHead(202);
         res.end();
     }
 
     function isAllowedOrigin(req) {
-        if (!allowedOrigins || allowedOrigins.length === 0) return true;
         const origin = req.headers.origin;
         if (!origin) return true;
         return allowedOrigins.includes(origin);
+    }
+
+    function isAuthorized(req) {
+        if (!authToken) return true;
+        const actual = String(req.headers.authorization || '');
+        const expected = 'Bearer ' + authToken;
+        const actualBuffer = Buffer.from(actual);
+        const expectedBuffer = Buffer.from(expected);
+        return actualBuffer.length === expectedBuffer.length &&
+            crypto.timingSafeEqual(actualBuffer, expectedBuffer);
     }
 
     function hasCompatibleProtocolHeader(req) {
@@ -103,57 +119,69 @@ function createHttpTransport(dispatcher, options) {
 
     // ── 处理 POST /mcp ───────────────────────────────────────────
     async function handleMcpPost(req, res) {
-        setCommonHeaders(res);
-
-        if (req.method === 'OPTIONS') {
-            res.writeHead(204);
-            res.end();
+        if (!isAllowedOrigin(req)) {
+            sendError(req, res, 403, -32600, 'Forbidden origin');
             return;
         }
 
-        if (!isAllowedOrigin(req)) {
-            sendError(res, 403, -32600, 'Forbidden origin');
+        if (!isAuthorized(req)) {
+            sendError(req, res, 401, -32001, 'Unauthorized');
             return;
         }
 
         if (!hasCompatibleProtocolHeader(req)) {
-            sendError(res, 400, -32600, 'Unsupported MCP-Protocol-Version');
+            sendError(req, res, 400, -32600, 'Unsupported MCP-Protocol-Version');
             return;
         }
 
-        if (req.method !== 'POST') {
-            sendError(res, 405, -32600, 'Method not allowed, use POST');
+        const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+        if (contentType !== 'application/json') {
+            sendError(req, res, 415, -32600, 'Content-Type must be application/json');
             return;
         }
 
         // 读取 body
-        let body = '';
-        req.on('data', chunk => body += chunk);
+        const chunks = [];
+        let bodyBytes = 0;
+        let bodyTooLarge = false;
+        req.on('data', chunk => {
+            bodyBytes += chunk.length;
+            if (bodyBytes > maxBodyBytes) {
+                if (!bodyTooLarge) {
+                    bodyTooLarge = true;
+                    sendError(req, res, 413, -32600, `Request body exceeds ${maxBodyBytes} bytes`);
+                }
+                return;
+            }
+            chunks.push(chunk);
+        });
         req.on('end', async () => {
+            if (bodyTooLarge) return;
+            const body = Buffer.concat(chunks).toString('utf8');
             let reqJson;
             try {
                 reqJson = JSON.parse(body);
             } catch (e) {
-                sendError(res, 400, -32700, 'Parse error');
+                sendError(req, res, 400, -32700, 'Parse error');
                 return;
             }
 
             try {
                 if (isJsonRpcNotificationOrResponse(reqJson)) {
-                    sendAccepted(res);
+                    sendAccepted(req, res);
                     return;
                 }
 
                 const resJson = await dispatchMessage(reqJson);
                 if (resJson) {
-                    sendJson(res, 200, resJson);
+                    sendJson(req, res, 200, resJson);
                 } else {
-                    sendAccepted(res);
+                    sendAccepted(req, res);
                 }
             } catch (err) {
-                sendJson(res, 200, {
+                sendJson(req, res, 200, {
                     jsonrpc: '2.0',
-                    id: reqJson.id || null,
+                    id: reqJson.id === undefined ? null : reqJson.id,
                     error: { code: -32603, message: `Internal error: ${err.message}` },
                 });
             }
@@ -162,16 +190,17 @@ function createHttpTransport(dispatcher, options) {
 
     // ── 处理 GET /mcp（初始化握手）────────────────────────────────
     function handleMcpGet(req, res) {
-        setCommonHeaders(res);
-
-        if (req.method === 'OPTIONS') {
-            res.writeHead(204);
-            res.end();
+        if (!isAllowedOrigin(req)) {
+            sendError(req, res, 403, -32600, 'Forbidden origin');
+            return;
+        }
+        if (!isAuthorized(req)) {
+            sendError(req, res, 401, -32001, 'Unauthorized');
             return;
         }
 
         // 返回服务器信息和可用端点说明
-        sendJson(res, 200, {
+        sendJson(req, res, 200, {
             name: 'mcp-sdk-http-transport',
             version: '1.0.0',
             protocolVersion,
@@ -184,38 +213,63 @@ function createHttpTransport(dispatcher, options) {
     }
 
     // ── 启动 HTTP 服务器 ─────────────────────────────────────────
+    function handleOptions(req, res) {
+        if (!isAllowedOrigin(req)) {
+            sendError(req, res, 403, -32600, 'Forbidden origin');
+            return;
+        }
+        setCommonHeaders(req, res);
+        res.writeHead(204);
+        res.end();
+    }
+
     function start() {
+        if (server) return Promise.reject(new Error('HTTP transport already started'));
         server = http.createServer((req, res) => {
             const parsedUrl = url.parse(req.url, true);
 
             // 路由分发
-            if (parsedUrl.pathname === path && req.method === 'POST') {
+            if (parsedUrl.pathname === path && req.method === 'OPTIONS') {
+                handleOptions(req, res);
+            } else if (parsedUrl.pathname === path && req.method === 'POST') {
                 handleMcpPost(req, res);
             } else if (parsedUrl.pathname === path && req.method === 'GET') {
                 handleMcpGet(req, res);
             } else if (parsedUrl.pathname === '/' && req.method === 'GET') {
-                sendJson(res, 200, { status: 'ok', timestamp: Date.now() });
+                if (!isAuthorized(req)) sendError(req, res, 401, -32001, 'Unauthorized');
+                else sendJson(req, res, 200, { status: 'ok', timestamp: Date.now() });
             } else {
-                sendError(res, 404, -32600, `Not found: ${req.url}`);
+                sendError(req, res, 404, -32600, `Not found: ${req.url}`);
             }
         });
 
-        server.listen(port, host, () => {
-            console.log(`[mcp-sdk] HTTP transport listening on http://${host}:${port}${path}`);
+        return new Promise((resolve, reject) => {
+            const candidate = server;
+            function onStartupError(err) {
+                if (server === candidate) server = null;
+                reject(err);
+            }
+            candidate.once('error', onStartupError);
+            candidate.listen(port, host, () => {
+                candidate.removeListener('error', onStartupError);
+                candidate.on('error', (err) => {
+                    console.error(`[mcp-sdk] HTTP server error: ${err.message}`);
+                });
+                const address = candidate.address();
+                const boundPort = address && address.port;
+                console.log(`[mcp-sdk] HTTP transport listening on http://${host}:${boundPort}${path}`);
+                resolve({ host, port: boundPort, path });
+            });
         });
-
-        server.on('error', (err) => {
-            console.error(`[mcp-sdk] HTTP server error: ${err.message}`);
-        });
-
-        return server;
     }
 
     function stop() {
-        if (server) {
-            server.close();
-            server = null;
-        }
+        if (!server) return Promise.resolve();
+        const activeServer = server;
+        server = null;
+        return new Promise((resolve, reject) => {
+            activeServer.close((err) => err ? reject(err) : resolve());
+        });
     }
 
     return { start, stop, port, host, path };
