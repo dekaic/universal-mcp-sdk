@@ -200,22 +200,33 @@ function createHttpTransport(dispatcher, options) {
             }
         });
 
-        server.listen(port, host, () => {
-            console.log(`[mcp-sdk] HTTP transport listening on http://${host}:${port}${path}`);
-        });
+        return new Promise((resolve, reject) => {
+            function onStartupError(err) {
+                server = null;
+                reject(err);
+            }
 
-        server.on('error', (err) => {
-            console.error(`[mcp-sdk] HTTP server error: ${err.message}`);
+            server.once('error', onStartupError);
+            server.listen(port, host, () => {
+                server.removeListener('error', onStartupError);
+                server.on('error', (err) => {
+                    console.error(`[mcp-sdk] HTTP server error: ${err.message}`);
+                });
+                const address = server.address();
+                const boundPort = address && address.port ? address.port : port;
+                console.log(`[mcp-sdk] HTTP transport listening on http://${host}:${boundPort}${path}`);
+                resolve({ port: boundPort, host, path });
+            });
         });
-
-        return server;
     }
 
     function stop() {
-        if (server) {
-            server.close();
-            server = null;
-        }
+        if (!server) return Promise.resolve();
+        const closing = server;
+        server = null;
+        return new Promise((resolve, reject) => {
+            closing.close((err) => err ? reject(err) : resolve());
+        });
     }
 
     return { start, stop, port, host, path };

@@ -43,34 +43,6 @@ function detectMode() {
     return 'http';
 }
 
-// ── 端口检测（避免冲突）─────────────────────────────────────────
-function findAvailablePort(startPort = 8080, maxRetries = 20) {
-    return new Promise((resolve) => {
-        const net = require('net');
-        let port = startPort;
-        let retries = 0;
-
-        function tryPort() {
-            const sock = net.createConnection({ port, host: '127.0.0.1' });
-            sock.on('connect', () => {
-                sock.destroy();
-                if (retries < maxRetries) {
-                    port++;
-                    retries++;
-                    tryPort();
-                } else {
-                    resolve(startPort + 100);
-                }
-            });
-            sock.on('error', () => {
-                sock.destroy();
-                resolve(port);
-            });
-        }
-        tryPort();
-    });
-}
-
 // ── 配置生成 ────────────────────────────────────────────────────
 function generateMcpJson(serverPath, port) {
     return {
@@ -129,6 +101,7 @@ function createServer(options) {
     // 启动后的引用
     let stdioTransport = null;
     let httpTransport = null;
+    let httpPort = null;
 
     // ── start() ──────────────────────────────────────────────────
     async function start(mode) {
@@ -139,31 +112,45 @@ function createServer(options) {
             stdioTransport = createStdioTransport(dispatcher);
             stdioTransport.start();
             console.log(`[mcp-sdk] stdio transport started (ready for Claude Code / Cursor)`);
+            return { mode: 'stdio' };
         } else {
-            // 解析 --port 命令行参数，优先级：--port argv > options.port > 自动探测
+            // 解析 --port 命令行参数，优先级：--port argv > options.port > 默认端口。
+            // 直接尝试 bind；EADDRINUSE 时递增重试，避免“探测空闲后再监听”的 TOCTOU 竞态。
             let startPort = options.port || 8080;
             const portArgIdx = process.argv.indexOf('--port');
             if (portArgIdx !== -1 && process.argv[portArgIdx + 1]) {
                 const parsed = parseInt(process.argv[portArgIdx + 1], 10);
                 if (!isNaN(parsed)) startPort = parsed;
             }
-            const port = await findAvailablePort(startPort);
-            httpTransport = createHttpTransport(dispatcher, {
-                port,
-                host: options.host || '127.0.0.1',
-                path: options.path || '/mcp',
-                protocolVersion: options.protocolVersion,
-                allowedOrigins: options.allowedOrigins,
-            });
-            httpTransport.start();
+            const maxRetries = 20;
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                const port = startPort + attempt;
+                httpTransport = createHttpTransport(dispatcher, {
+                    port,
+                    host: options.host || '127.0.0.1',
+                    path: options.path || '/mcp',
+                    protocolVersion: options.protocolVersion,
+                    allowedOrigins: options.allowedOrigins,
+                });
+                try {
+                    const bound = await httpTransport.start();
+                    httpPort = bound.port;
+                    return { mode: 'http', port: bound.port, host: bound.host, path: bound.path };
+                } catch (err) {
+                    await httpTransport.stop();
+                    httpTransport = null;
+                    if (!err || err.code !== 'EADDRINUSE' || attempt === maxRetries) throw err;
+                }
+            }
         }
     }
 
     // ── stop() ──────────────────────────────────────────────────
-    function stop() {
+    async function stop() {
         if (httpTransport) {
-            httpTransport.stop();
+            await httpTransport.stop();
             httpTransport = null;
+            httpPort = null;
         }
     }
 
@@ -215,6 +202,7 @@ function createServer(options) {
         generateMcpJson,
         generateMavisEntry,
         generateOpenAIResponsesTool,
+        get port() { return httpPort; },
     };
 }
 
