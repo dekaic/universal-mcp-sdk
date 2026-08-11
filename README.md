@@ -47,12 +47,22 @@ const server = createServer({
     ],
 });
 
-server.start();
+server.start().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+});
 ```
 
 直接 `node your-server.js` 启动时，SDK 会自动检测运行环境：
 - **TTY 终端**（交互式启动）→ stdio 模式
 - **非 TTY / 后台服务**（默认）→ HTTP 模式，监听 `http://127.0.0.1:8080/mcp`
+
+HTTP 模式直接执行 bind；若端口已被占用，会从请求端口开始递增重试（最多 20 次），避免“先探测空闲、稍后监听”的并发竞态。需要记录实际 endpoint 时应等待返回值：
+
+```js
+const started = await server.start('http');
+console.log(started.port, started.host, started.path);
+```
 
 需要强制指定模式时：
 
@@ -183,10 +193,10 @@ client                                  server
 **② 工具执行错误** —— `tools/call` / `resources/read` 中 handler 抛异常、或 tool/resource 不存在时，**不返回协议 `error`**，而是返回**成功响应**，错误信息塞进 content、文本以 `[Error]` 开头：
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[Error] [hello] Error: something broke"}]}}
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[Error] [hello] Error: something broke"}],"isError":true}}
 ```
 
-> 判断工具调用是否成功，看 `result.content[].text` 是否以 `[Error]` 开头——本实现用**文本前缀**标识工具错误，未使用 MCP 可选的 `isError` 字段。
+> handler 异常和缺少 schema 顶层 `required` 参数时会同时返回 `[Error]` 文本与 `isError: true`。兼容旧调用方时仍应识别 `[Error]` 文本；当前只统一检查顶层 required，不执行完整 JSON Schema 校验。
 
 ### content block 类型
 
@@ -316,7 +326,7 @@ curl -X POST http://127.0.0.1:8080/mcp \
 | `tools` | Array | 否 | tool 定义列表 |
 | `resources` | Array | 否 | resource 定义列表 |
 | `customHandlers` | object | 否 | 自定义 JSON-RPC 方法 |
-| `port` | number | 否 | HTTP 模式端口，默认 8080 |
+| `port` | number | 否 | HTTP 模式起始端口，默认 8080；占用时递增 bind |
 | `entryPoint` | string | 否 | 用于生成配置文件的入口路径 |
 
 ### tool(name, description, inputSchema, handler)
@@ -334,6 +344,8 @@ handler 返回值会自动包装为 MCP content block：
 | `object` | `textContent(JSON.stringify(result))` |
 | `Array` (content block) | 直接使用 |
 | `undefined` / `null` | `textContent('(ok)')` |
+
+`server.start(mode)` 返回 Promise。HTTP 模式 resolve 为 `{mode:'http', port, host, path}`，且只在真实监听成功后完成；`server.stop()` 也返回 Promise，并等待 HTTP listener 关闭。tool schema 的顶层 `required` 字段会在 handler 前检查。
 
 ### command(name, description, handler)
 
@@ -388,6 +400,7 @@ mcp-sdk/
 ├── tool.js                     # tool 定义辅助
 ├── resource.js                 # resource 定义辅助
 ├── test-server.js              # 可运行的测试示例服务器
+├── test/                       # node:test 回归（端口并发与 required 参数）
 ├── protocol/
 │   ├── dispatcher.js           # JSON-RPC 2.0 核心分发
 │   └── content.js              # content block 封装
