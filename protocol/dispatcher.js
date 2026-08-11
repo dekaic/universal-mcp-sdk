@@ -79,6 +79,19 @@ function createDispatcher(options) {
         return { jsonrpc: '2.0', id, result };
     }
 
+    function missingRequiredArguments(tool, args) {
+        const required = tool.inputSchema && Array.isArray(tool.inputSchema.required)
+            ? tool.inputSchema.required
+            : [];
+        const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+        return required.filter((key) => !Object.prototype.hasOwnProperty.call(input, key) || input[key] === undefined);
+    }
+
+    function requiredArgumentsMessage(toolName, missing) {
+        const label = missing.length === 1 ? 'argument' : 'arguments';
+        return `[${toolName}] Missing required ${label}: ${missing.join(', ')}`;
+    }
+
     // ── 同步分发（用于不需要 await 的方法）────────────────────────
     function dispatch(req) {
         if (req.jsonrpc !== '2.0') {
@@ -151,6 +164,13 @@ function createDispatcher(options) {
                 const tool = tools.find(t => t.name === params.name);
                 if (!tool) {
                     return makeSuccessResponse(id, { content: [errorContent(`Tool not found: ${params.name}`)] });
+                }
+                const missing = missingRequiredArguments(tool, params.arguments);
+                if (missing.length > 0) {
+                    return makeSuccessResponse(id, {
+                        content: [errorContent(requiredArgumentsMessage(params.name, missing))],
+                        isError: true,
+                    });
                 }
                 try {
                     const result = await tool.handler(params.arguments || {});
