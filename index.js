@@ -106,17 +106,17 @@ function createServer(options) {
     // ── start() ──────────────────────────────────────────────────
     async function start(mode) {
         const actualMode = mode || detectMode();
-        console.log(`[mcp-sdk] Starting in ${actualMode} mode...`);
+        console.error(`[mcp-sdk] Starting in ${actualMode} mode...`);
 
         if (actualMode === 'stdio') {
             stdioTransport = createStdioTransport(dispatcher);
             stdioTransport.start();
-            console.log(`[mcp-sdk] stdio transport started (ready for Claude Code / Cursor)`);
+            console.error(`[mcp-sdk] stdio transport started (ready for Claude Code / Cursor)`);
             return { mode: 'stdio' };
         } else {
             // 解析 --port 命令行参数，优先级：--port argv > options.port > 默认端口。
             // 直接尝试 bind；EADDRINUSE 时递增重试，避免“探测空闲后再监听”的 TOCTOU 竞态。
-            let startPort = options.port || 8080;
+            let startPort = options.port === undefined ? 8080 : options.port;
             const portArgIdx = process.argv.indexOf('--port');
             if (portArgIdx !== -1 && process.argv[portArgIdx + 1]) {
                 const parsed = parseInt(process.argv[portArgIdx + 1], 10);
@@ -131,6 +131,8 @@ function createServer(options) {
                     path: options.path || '/mcp',
                     protocolVersion: options.protocolVersion,
                     allowedOrigins: options.allowedOrigins,
+                    bearerToken: options.bearerToken,
+                    maxBodyBytes: options.maxBodyBytes,
                 });
                 try {
                     const bound = await httpTransport.start();

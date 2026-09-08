@@ -31,6 +31,6 @@ test('dispatcher rejects missing required arguments before invoking a tool', asy
     });
 
     assert.equal(calls, 0);
-    assert.equal(response.result.isError, true);
-    assert.match(response.result.content[0].text, /\[scene_open_scene\] Missing required argument: uuid/);
+    assert.equal(response.error.code, -32602);
+    assert.match(response.error.message, /\[scene_open_scene\] Missing required argument: uuid/);
 });

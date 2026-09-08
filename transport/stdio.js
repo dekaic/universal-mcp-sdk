@@ -10,10 +10,42 @@
 
 const EventEmitter = require('events');
 
+function createMessageHandler(dispatcher) {
+    let protocolVersion = '2025-06-18';
+    let initializing = false;
+    let handshake = false;
+    let ready = false;
+    function error(id, message) { return { jsonrpc: '2.0', id: id === undefined ? null : id, error: { code: -32600, message } }; }
+    return async function handle(req) {
+        if (Array.isArray(req)) {
+            if (protocolVersion !== '2025-03-26' || !req.length || req.some(item => item && item.method === 'initialize')) return error(null, 'Invalid batch for negotiated protocol');
+            const responses = (await Promise.all(req.map(item => Array.isArray(item)
+                ? error(null, 'Batch entries must be single messages') : handle(item)))).filter(Boolean);
+            return responses.length ? responses : null;
+        }
+        if (req && req.method === 'initialize') {
+            if (handshake || initializing) return error(req.id, 'Initialization is already in progress or complete');
+            initializing = true;
+            try {
+                const response = await dispatcher.dispatchAsync(req);
+                if (response && response.result) { protocolVersion = response.result.protocolVersion; handshake = true; }
+                return response;
+            } finally { initializing = false; }
+        }
+        if (req && req.method === 'notifications/initialized') {
+            if (req.id !== undefined || !handshake) return error(req.id, 'Initialize before the initialized notification');
+            const response = await dispatcher.dispatchAsync(req);
+            if (!response) ready = true;
+            return response;
+        }
+        if (!ready && req && req.method !== 'ping') return error(req.id, 'Initialization must complete before use');
+        return dispatcher.dispatchAsync(req, { protocolVersion });
+    };
+}
+
 function createStdioTransport(dispatcher) {
     const emitter = new EventEmitter();
-
-    let initialized = false;
+    const handle = createMessageHandler(dispatcher);
     let buffer = '';
 
     function start() {
@@ -33,26 +65,14 @@ function createStdioTransport(dispatcher) {
 
                 try {
                     const req = JSON.parse(line);
-                    // notification（无 id）不等待响应
-                    if (req.id === undefined) {
-                        dispatcher.dispatchAsync(req).catch(err => {
-                            // notification 错误不返回（无 id）
-                            process.stderr.write(JSON.stringify({
-                                jsonrpc: '2.0',
-                                error: { code: -32603, message: `Internal error: ${err.message}` },
-                            }) + '\n');
-                        });
-                        continue;
-                    }
-
-                    dispatcher.dispatchAsync(req).then((res) => {
+                    handle(req).then((res) => {
                         if (res) {
                             process.stdout.write(JSON.stringify(res) + '\n');
                         }
                     }).catch((err) => {
                         process.stdout.write(JSON.stringify({
                             jsonrpc: '2.0',
-                            id: req.id || null,
+                            id: req && req.id !== undefined ? req.id : null,
                             error: { code: -32603, message: `Internal error: ${err.message}` },
                         }) + '\n');
                     });
@@ -86,4 +106,4 @@ function createStdioTransport(dispatcher) {
     return { start, emitter };
 }
 
-module.exports = { createStdioTransport };
+module.exports = { createStdioTransport, createMessageHandler };

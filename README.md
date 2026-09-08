@@ -2,14 +2,9 @@
 
 跨 Agent 的 MCP Server 开发套件。一次实现，多端接入。
 
-**已实测接通：**
+当前工作树的协议回归覆盖 stdio 与 JSON-only Streamable HTTP；历史客户端连通记录不代表新版协议已逐一验收。
 
-- **Claude Code** / **Cursor** — stdio 传输
-- **Mavis** — streamable-http 传输
-- **OpenAI / ChatGPT** — remote MCP（streamable-http，需公网 HTTPS `/mcp` 或 Secure MCP Tunnel）
-- **任何 HTTP-based AI Agent** — streamable-http 传输
-
-> OpenAI Responses API 与 ChatGPT Apps 侧接入时，`server_url` 必须是外部可访问的 HTTPS `/mcp` 端点；本机 `127.0.0.1` 只适合本地客户端或通过 Secure MCP Tunnel / ngrok / Cloudflare Tunnel 暴露。
+SDK 提供通用协议能力。cocos-mcp Product 另行强制本机 loopback、每代服务认证及实例身份，不允许公网隧道、浏览器 Origin 豁免或免认证回退。
 
 ---
 
@@ -131,14 +126,14 @@ server.start();
 | 模式 | 命令 | 适用场景 |
 |------|------|---------|
 | stdio | `node your-server.js --stdio` | Claude Code / Cursor（子进程） |
-| http | `node your-server.js --http --port 8080` | Mavis / OpenAI / HTTP Agent（常驻服务），--port 真正生效 |
+| http | `node your-server.js --http --port 8080` | 支持认证、session 与协议协商的本机 HTTP 客户端 |
 | auto | `node your-server.js` | 自动检测：TTY → stdio，否则 → HTTP |
 
 ---
 
 ## 接入协议（Wire Protocol）
 
-任何客户端 / Agent 接入本 SDK 起的 server，都走 **MCP over JSON-RPC 2.0**，协议版本 `2024-11-05`。stdio 与 streamable-http 两种通道的**消息体格式完全一致**，区别只在传输方式。
+任何客户端 / Agent 接入本 SDK 起的 server，都走 **MCP over JSON-RPC 2.0**，协商协议版本 `2025-03-26` 或 `2025-06-18`。stdio 与 streamable-http 两种通道的**消息体格式完全一致**，区别只在传输方式。
 
 ### 握手顺序
 
@@ -146,7 +141,7 @@ server.start();
 client                                  server
   │── initialize ───────────────────────▶│  必须最先调，换取 protocolVersion / capabilities / serverInfo
   │◀──────────────────────── result ─────│
-  │── notifications/initialized ────────▶│  (可选) 通知，无 id、无响应
+  │── notifications/initialized ────────▶│  必须发送通知，无 id、无响应
   │── tools/list ───────────────────────▶│  枚举工具
   │◀──────────────────────── result ─────│
   │── tools/call {name, arguments} ─────▶│  调用工具
@@ -157,16 +152,18 @@ client                                  server
 
 | method | params | 响应 | 备注 |
 |--------|--------|------|------|
-| `initialize` | — | `{protocolVersion, capabilities, serverInfo}` | 握手，必须第一个调 |
-| `notifications/initialized`（亦接受 `initialized`） | — | 无 | 通知，无 id 不回包 |
+| `initialize` | `{protocolVersion, capabilities, clientInfo:{name,version}}` | `{protocolVersion, capabilities, serverInfo}` | 握手，必须第一个调 |
+| `notifications/initialized` | — | 无 | 通知，无 id 不回包 |
 | `ping` | — | `{}` | 心跳 |
 | `tools/list` | — | `{tools:[{name, description, inputSchema}]}` | 列工具 |
 | `tools/call` | `{name, arguments}` | `{content:[…]}` | 调工具 |
 | `resources/list` | — | `{resources:[{uri, name, description, mimeType}]}` | 列资源 |
-| `resources/read` | `{uri}` | `{contents:[{type, text, mimeType}]}` | 读资源 |
+| `resources/read` | `{uri}` | `{contents:[{uri, text, mimeType}]}` | 读资源 |
 | 自定义 method | 任意 | 由 `customHandlers` 返回 | 见 `createServer` 的 `customHandlers` |
 
-> 调用任何业务方法前**必须先 `initialize`**；未知 method 一律返回 `-32601`。
+> 调用任何业务方法前必须完成 `initialize` 和 `notifications/initialized`。未知请求 method 返回 `-32601`；合法通知不回包，包括未知通知和通知 handler 失败。
+
+初始化的 `capabilities` 必须是对象，数组不能建立会话。`2025-03-26` batch 仅处理一层消息：嵌套数组项返回 `-32600`，不执行其内容；合法兄弟请求仍独立处理，响应数组不嵌套。纯通知 batch 不回包（HTTP 为 202 空 body）。`2025-06-18` 继续拒绝 batch，工具 arguments 内正常的数组不受影响。
 
 ### 消息格式
 
@@ -190,13 +187,9 @@ client                                  server
 | `-32601` | method 不存在 |
 | `-32603` | 服务器内部异常 |
 
-**② 工具执行错误** —— `tools/call` / `resources/read` 中 handler 抛异常、或 tool/resource 不存在时，**不返回协议 `error`**，而是返回**成功响应**，错误信息塞进 content、文本以 `[Error]` 开头：
+**② 工具执行错误** —— 工具 handler 抛异常时返回 `isError:true` 和可见错误内容，不与 JSON-RPC 格式错误混淆。缺失工具名、未知工具及无效 arguments 返回 `-32602`；找不到资源为 `-32002`，资源读取异常为 `-32603`。
 
-```json
-{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[Error] [hello] Error: something broke"}],"isError":true}}
-```
-
-> handler 异常和缺少 schema 顶层 `required` 参数时会同时返回 `[Error]` 文本与 `isError: true`。兼容旧调用方时仍应识别 `[Error]` 文本；当前只统一检查顶层 required，不执行完整 JSON Schema 校验。
+参数验证覆盖本产品使用的 type、required、additionalProperties、enum、数值/长度边界和组合分支，不宣称实现完整 JSON Schema。`_meta` 等合法 MCP envelope 字段不作为未知业务参数拒绝。带 `_meta` 的业务对象仍保留业务 payload；同时提供 `structuredContent` 和额外业务字段时，即使未提供 `content`，额外字段也保留在独立的文本 content 项中，不合并进结构化结果或改变其 schema。声明 outputSchema 的工具由应用层确保成功和错误结果符合声明。
 
 ### content block 类型
 
@@ -221,12 +214,14 @@ handler 直接返回 string / object 时，SDK 自动包成 text（见下方 API
 
 | 端点 | 方法 | 作用 |
 |------|------|------|
-| `/mcp` | `POST` | 主通道：body = JSON-RPC 请求，回 `200 application/json`；通知 → `204` 无 body |
-| `/mcp` | `GET` | 返回 server 信息 + 端点说明（**注意：握手 `initialize` 走 POST，不是这个 GET**） |
-| `/` | `GET` | 健康检查 `{status:"ok"}` |
+| `/mcp` | `POST` | JSON-RPC；请求结果 `200 application/json`，通知/响应接受后 `202` |
+| `/mcp` | `GET` / `OPTIONS` | `405`，不提供 SSE 或 CORS 预检开放路径 |
+| `/health` | `GET` | 同样认证的健康检查 `{status:"ok"}` |
 
-- 所有端点开 **CORS**（`Access-Control-Allow-Origin: *`），浏览器 / 跨域客户端可直连，`OPTIONS` 预检回 `204`
-- **无 session、无 SSE**：每个 POST 是独立的请求 / 响应，接入方不需要维护 session id
+- 默认拒绝任何 Origin。通用 SDK 可传入明确 allowedOrigins；cocos-mcp Product 固定为空，不能开放浏览器豁免。
+- HTTP 使用服务生成的 `Mcp-Session-Id`。initialize 后发送 initialized，后续带协商后的 `MCP-Protocol-Version`。会话失效不表示执行取消，也不能成为重放修改的依据。
+- POST 必须带 JSON Content-Type 和允许 `application/json, text/event-stream` 的 Accept；默认实际 body 上限 8 MiB。
+- `2025-03-26` 支持非空 batch；`2025-06-18` 拒绝 batch。HTTP 不声明 tools/list_changed 推送能力。
 
 ---
 
@@ -247,71 +242,36 @@ handler 直接返回 string / object 时，SDK 自动包成 text（见下方 API
 }
 ```
 
-### Mavis
+### 本机 HTTP 客户端
 
-在 `~/.mavis/mcp/mcp.json`（或项目 `.mavis/mcp/mcp.json`）添加：
+客户端从应用的私有凭据渠道取得 endpoint 和 bearer，不把它们放入命令行参数、URL 或日志。下面仅展示 Node 客户端握手；不是浏览器示例，也不自动重试修改：
 
-```json
-{
-  "mcpServers": {
-    "my-mcp": {
-      "url": "http://127.0.0.1:8080/mcp",
-      "type": "streamable-http",
-      "env": {},
-      "enabled": true,
-      "description": "我的 MCP 服务"
+```js
+async function connectLocalMcp({ endpoint, bearerToken }) {
+    let protocolVersion = '2025-06-18';
+    let sessionId;
+    async function request(message) {
+        const response = await fetch(endpoint, { method: 'POST',
+            headers: { 'Content-Type': 'application/json',
+                Accept: 'application/json, text/event-stream',
+                Authorization: 'Bearer ' + bearerToken,
+                'MCP-Protocol-Version': protocolVersion,
+                ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}) },
+            body: JSON.stringify(message) });
+        if (!response.ok) throw new Error('MCP HTTP ' + response.status);
+        if (response.headers.has('mcp-session-id')) sessionId = response.headers.get('mcp-session-id');
+        return response.status === 202 ? null : response.json();
     }
-  }
+    const initialized = await request({ jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion, capabilities: {}, clientInfo: { name: 'local-client', version: '1' } } });
+    if (initialized.error) throw new Error(initialized.error.message);
+    protocolVersion = initialized.result.protocolVersion;
+    await request({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    return request;
 }
 ```
 
-### OpenAI Responses API / ChatGPT
-
-OpenAI 侧使用 remote MCP 时，需要一个公网 HTTPS `/mcp` 地址。本地调试可先用 Secure MCP Tunnel、ngrok 或 Cloudflare Tunnel 把 `http://127.0.0.1:<port>/mcp` 暴露出去。
-
-Responses API 示例：
-
-```js
-const OpenAI = require('openai');
-const client = new OpenAI();
-
-const resp = await client.responses.create({
-    model: 'gpt-5.5',
-    tools: [{
-        type: 'mcp',
-        server_label: 'my_mcp',
-        server_description: 'My MCP server',
-        server_url: 'https://your-domain.example/mcp',
-        require_approval: 'always',
-    }],
-    input: 'Call a tool from my MCP server.',
-});
-
-console.log(resp.output_text);
-```
-
-ChatGPT Apps / Connectors 开发者模式里创建 connector 时，`Connector URL` 填同一个公网 HTTPS `/mcp` 地址。
-
-### 其他 HTTP Agent
-
-直接 POST 请求到 `http://127.0.0.1:8080/mcp`：
-
-```bash
-# 1) 握手 initialize（走 POST，不是 GET —— GET /mcp 只返回 server 信息）
-curl -X POST http://127.0.0.1:8080/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-
-# 2) 列工具
-curl -X POST http://127.0.0.1:8080/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-
-# 3) 调用 tool
-curl -X POST http://127.0.0.1:8080/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hello","arguments":{"name":"world"}}}'
-```
+cocos-mcp 调用方还必须迁移目标绑定、operationId 和未知结果处理，见 Product 的执行契约；不能照搬独立 SDK 的无目标 hello 示例来修改 Creator。
 
 ---
 
@@ -327,6 +287,9 @@ curl -X POST http://127.0.0.1:8080/mcp \
 | `resources` | Array | 否 | resource 定义列表 |
 | `customHandlers` | object | 否 | 自定义 JSON-RPC 方法 |
 | `port` | number | 否 | HTTP 模式起始端口，默认 8080；占用时递增 bind |
+| `bearerToken` | string | 否 | HTTP 认证凭据；Product 必须设置且不公开输出 |
+| `allowedOrigins` | string[] | 否 | 默认 `[]`；Product 不允许覆盖 |
+| `maxBodyBytes` | number | 否 | 默认 8 MiB，按实际接收字节计量 |
 | `entryPoint` | string | 否 | 用于生成配置文件的入口路径 |
 
 ### tool(name, description, inputSchema, handler)
@@ -345,7 +308,7 @@ handler 返回值会自动包装为 MCP content block：
 | `Array` (content block) | 直接使用 |
 | `undefined` / `null` | `textContent('(ok)')` |
 
-`server.start(mode)` 返回 Promise。HTTP 模式 resolve 为 `{mode:'http', port, host, path}`，且只在真实监听成功后完成；`server.stop()` 也返回 Promise，并等待 HTTP listener 关闭。tool schema 的顶层 `required` 字段会在 handler 前检查。
+`server.start(mode)` 返回 Promise。HTTP 模式 resolve 为 `{mode:'http', port, host, path}`，且只在真实监听成功后完成；`server.stop()` 也返回 Promise，并等待 HTTP listener 关闭。声明的受支持参数约束在 handler 前检查。
 
 ### command(name, description, handler)
 
@@ -388,7 +351,7 @@ server.addResource({
 server.printConfig();
 ```
 
-输出 Claude Code 配置和 Mavis 配置，可直接复制使用。
+输出通用配置模板；HTTP 模板不包含私有认证信息，不能单独作为可调用配置。Product 使用自己的受控 Router 接入流程。
 
 ---
 

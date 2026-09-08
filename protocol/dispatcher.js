@@ -7,7 +7,49 @@
 
 const { textContent, errorContent } = require('./content');
 
-const DEFAULT_PROTOCOL_VERSION = '2025-03-26';
+const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
+const SUPPORTED_PROTOCOL_VERSIONS = ['2025-03-26', '2025-06-18'];
+
+// Deliberately limited validation of declared arguments, not a full JSON Schema engine.
+function validateArguments(schema, value, at = 'arguments') {
+    schema = schema || {};
+    const types = { object: v => v !== null && typeof v === 'object' && !Array.isArray(v),
+        array: Array.isArray, string: v => typeof v === 'string', boolean: v => typeof v === 'boolean',
+        number: v => typeof v === 'number' && Number.isFinite(v), integer: Number.isSafeInteger,
+        null: v => v === null };
+    if (at === 'arguments' && !types.object(value)) return at + ' must be an object';
+    if (schema.type && types[schema.type] && !types[schema.type](value)) return at + ' must be ' + schema.type;
+    if (schema.enum && !schema.enum.includes(value)) return at + ' has an invalid value';
+    if (schema.const !== undefined && value !== schema.const) return at + ' has an invalid value';
+    if (typeof value === 'string' && schema.minLength && value.length < schema.minLength) return at + ' is too short';
+    if (typeof value === 'string' && schema.maxLength !== undefined && value.length > schema.maxLength) return at + ' is too long';
+    if (typeof value === 'number' && (value < schema.minimum || value > schema.maximum)) return at + ' is outside the permitted range';
+    if (typeof value === 'number' && (value <= schema.exclusiveMinimum || value >= schema.exclusiveMaximum)) return at + ' is outside the exclusive range';
+    if (Array.isArray(value) && (value.length < schema.minItems || value.length > schema.maxItems)) return at + ' has an invalid item count';
+    if (schema.oneOf || schema.anyOf) {
+        const matches = (schema.oneOf || schema.anyOf).filter(s => !validateArguments(s, value, at));
+        if (!matches.length || (schema.oneOf && matches.length !== 1)) return at + ' does not match an allowed shape';
+    }
+    if (types.object(value)) {
+        for (const key of schema.required || []) if (!Object.hasOwn(value, key)) return at + '.' + key + ' is required';
+        for (const key of Object.keys(value)) {
+            const properties = schema.properties || {};
+            if (!Object.hasOwn(properties, key)) {
+                if (schema.additionalProperties === false) return at + '.' + key + ' is unknown';
+            } else {
+                const error = validateArguments(properties[key], value[key], at + '.' + key);
+                if (error) return error;
+            }
+        }
+    }
+    if (Array.isArray(value) && schema.items) {
+        for (let i = 0; i < value.length; i++) {
+            const error = validateArguments(schema.items, value[i], at + '[' + i + ']');
+            if (error) return error;
+        }
+    }
+    return null;
+}
 
 /**
  * 创建 MCP 分发器
@@ -35,11 +77,13 @@ function createDispatcher(options) {
         if (tool.outputSchema) schema.outputSchema = tool.outputSchema;
         if (tool.annotations) schema.annotations = tool.annotations;
         if (tool._meta) schema._meta = tool._meta;
+        if (tool.title) schema.title = tool.title;
         return schema;
     }
 
     function toResourceSchema(res) {
         return {
+            ...Object.fromEntries(Object.entries(res).filter(([key]) => key !== 'read')),
             uri: res.uri,
             name: res.name || res.uri,
             description: res.description || '',
@@ -63,7 +107,10 @@ function createDispatcher(options) {
             if (result._meta !== undefined) out._meta = result._meta;
             if (result.isError !== undefined) out.isError = result.isError;
             if (Object.keys(out).length > 0) {
-                if (!out.content) out.content = wrapContent(out.structuredContent || '(ok)');
+                const business = Object.fromEntries(Object.entries(result).filter(([key]) => !['content', 'structuredContent', '_meta', 'isError'].includes(key)));
+                if (!out.content) out.content = wrapContent(out.structuredContent || (Object.keys(business).length ? business : '(ok)'));
+                // Keep extra fields separate from the declared structured result.
+                if ((result.content || result.structuredContent) && Object.keys(business).length) out.content = out.content.concat(wrapContent(business));
                 return out;
             }
         }
@@ -71,7 +118,7 @@ function createDispatcher(options) {
     }
 
     function makeErrorResponse(id, message, code = -32603) {
-        return { jsonrpc: '2.0', id: id || null, error: { code, message } };
+        return { jsonrpc: '2.0', id: id === undefined ? null : id, error: { code, message } };
     }
 
     function makeSuccessResponse(id, result) {
@@ -93,20 +140,25 @@ function createDispatcher(options) {
     }
 
     // ── 同步分发（用于不需要 await 的方法）────────────────────────
-    function dispatch(req) {
+    function dispatch(req, context) {
+        if (!req || typeof req !== 'object' || Array.isArray(req)) return makeErrorResponse(null, 'Invalid Request', -32600);
         if (req.jsonrpc !== '2.0') {
             return makeErrorResponse(req.id, 'Invalid Request', -32600);
         }
-        if (typeof req.method !== 'string') {
+        if (req.method === undefined && req.id !== undefined && ((req.result !== undefined) !== (req.error !== undefined))) return null;
+        if (typeof req.method !== 'string' || (req.id !== undefined && typeof req.id !== 'string' && typeof req.id !== 'number') || (req.params !== undefined && (!req.params || typeof req.params !== 'object' || Array.isArray(req.params)))) {
             return makeErrorResponse(req.id, 'Invalid Request', -32600);
         }
 
         const { method, params, id } = req;
 
+        if (id === undefined && !method.startsWith('notifications/')) return makeErrorResponse(null, 'Requests require an id', -32600);
+
         switch (method) {
             case 'initialize':
+                if (id === undefined || !params || typeof params.protocolVersion !== 'string' || !params.clientInfo || typeof params.clientInfo.name !== 'string' || typeof params.clientInfo.version !== 'string' || !params.capabilities || typeof params.capabilities !== 'object' || Array.isArray(params.capabilities)) return makeErrorResponse(id, 'Invalid initialization parameters', -32602);
                 return makeSuccessResponse(id, {
-                    protocolVersion,
+                    protocolVersion: params && SUPPORTED_PROTOCOL_VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : protocolVersion,
                     capabilities: {
                         tools: tools.length > 0 ? {} : undefined,
                         resources: resources.length > 0 ? {} : undefined,
@@ -137,43 +189,46 @@ function createDispatcher(options) {
                         const result = customHandlers[method](params, { tools, resources, name, version });
                         return makeSuccessResponse(id, result);
                     } catch (e) {
-                        return makeErrorResponse(id, e.message);
+                        return id === undefined ? null : makeErrorResponse(id, e.message);
                     }
                 }
-                return makeErrorResponse(id, `Method not found: ${method}`, -32601);
+                return id === undefined ? null : makeErrorResponse(id, `Method not found: ${method}`, -32601);
             }
         }
     }
 
     // ── 异步分发（用于 tools/call 和 resources/read，需要 await handler）───
-    async function dispatchAsync(req) {
+    async function dispatchAsync(req, context) {
+        if (!req || typeof req !== 'object' || Array.isArray(req)) return makeErrorResponse(null, 'Invalid Request', -32600);
         if (req.jsonrpc !== '2.0') {
             return makeErrorResponse(req.id, 'Invalid Request', -32600);
         }
-        if (typeof req.method !== 'string') {
+        if (req.method === undefined && req.id !== undefined && ((req.result !== undefined) !== (req.error !== undefined))) return null;
+        if (typeof req.method !== 'string' || (req.id !== undefined && typeof req.id !== 'string' && typeof req.id !== 'number') || (req.params !== undefined && (!req.params || typeof req.params !== 'object' || Array.isArray(req.params)))) {
             return makeErrorResponse(req.id, 'Invalid Request', -32600);
         }
 
         const { method, params, id } = req;
 
+        if (id === undefined && !method.startsWith('notifications/')) return makeErrorResponse(null, 'Requests require an id', -32600);
+
         switch (method) {
             case 'tools/call': {
                 if (!params || !params.name) {
-                    return makeSuccessResponse(id, { content: [errorContent('Missing tool name')] });
+                    return makeErrorResponse(id, 'Missing tool name', -32602);
                 }
                 const tool = tools.find(t => t.name === params.name);
                 if (!tool) {
-                    return makeSuccessResponse(id, { content: [errorContent(`Tool not found: ${params.name}`)] });
+                    return makeErrorResponse(id, `Tool not found: ${params.name}`, -32602);
                 }
                 const missing = missingRequiredArguments(tool, params.arguments);
                 if (missing.length > 0) {
-                    return makeSuccessResponse(id, {
-                        content: [errorContent(requiredArgumentsMessage(params.name, missing))],
-                        isError: true,
-                    });
+                    return makeErrorResponse(id, requiredArgumentsMessage(params.name, missing), -32602);
                 }
+                const argumentError = validateArguments(tool.inputSchema, params.arguments === undefined ? {} : params.arguments);
+                if (argumentError) return makeErrorResponse(id, '[' + params.name + '] ' + argumentError, -32602);
                 try {
-                    const result = await tool.handler(params.arguments || {});
+                    const result = await tool.handler(params.arguments || {}, { ...(context || {}), requestMeta: params._meta });
                     return makeSuccessResponse(id, normalizeToolResult(result));
                 } catch (e) {
                     return makeSuccessResponse(id, {
@@ -184,20 +239,20 @@ function createDispatcher(options) {
             }
 
             case 'resources/read': {
-                if (!params || !params.uri) {
-                    return makeSuccessResponse(id, { contents: [errorContent('Missing resource uri')] });
+                if (!params || typeof params.uri !== 'string' || !params.uri) {
+                    return makeErrorResponse(id, 'Missing resource uri', -32602);
                 }
                 const res = resources.find(r => r.uri === params.uri);
                 if (!res) {
-                    return makeSuccessResponse(id, { contents: [errorContent(`Resource not found: ${params.uri}`)] });
+                    return makeErrorResponse(id, `Resource not found: ${params.uri}`, -32002);
                 }
                 try {
                     const data = await res.read();
                     const mimeType = res.mimeType || 'text/plain';
                     const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-                    return makeSuccessResponse(id, { contents: [{ type: 'text', text, mimeType }] });
+                    return makeSuccessResponse(id, { contents: [{ uri: res.uri, text, mimeType }] });
                 } catch (e) {
-                    return makeSuccessResponse(id, { contents: [errorContent(`[${params.uri}] Error: ${e.message}`)] });
+                    return makeErrorResponse(id, `[${params.uri}] Error: ${e.message}`, -32603);
                 }
             }
 
@@ -206,11 +261,11 @@ function createDispatcher(options) {
                 return null; // notification
 
             default:
-                return dispatch(req);
+                return dispatch(req, context);
         }
     }
 
     return { dispatch, dispatchAsync };
 }
 
-module.exports = { createDispatcher };
+module.exports = { createDispatcher, validateArguments };

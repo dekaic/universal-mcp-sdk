@@ -20,7 +20,7 @@ function reserveThenReleasePort() {
 
 function getHealth(port) {
     return new Promise((resolve, reject) => {
-        const request = http.get('http://127.0.0.1:' + port + '/', (response) => {
+        const request = http.get('http://127.0.0.1:' + port + '/health', (response) => {
             const chunks = [];
             response.on('data', (chunk) => chunks.push(chunk));
             response.on('end', () => resolve({
