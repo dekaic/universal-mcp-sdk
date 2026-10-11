@@ -305,8 +305,11 @@ handler 返回值会自动包装为 MCP content block：
 |---------|---------|
 | `string` | `textContent(text)` |
 | `object` | `textContent(JSON.stringify(result))` |
-| `Array` (content block) | 直接使用 |
+| 非空 `Array`（每项均为已知内容类型，且必需字段类型正确） | 直接使用 |
+| 其他 `Array`（业务数据、混合项或缺少必需字段） | 整体序列化为 JSON 文本，保留全部数据 |
 | `undefined` / `null` | `textContent('(ok)')` |
+
+裸数组的识别覆盖 [MCP 2025-06-18 内容类型](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool-result)：text、image、audio、resource_link 和 resource；仅有 `type` 字段不足以判定为内容块。显式 `{ content, structuredContent, _meta, isError }` 结果仍由 handler 保证符合协议，SDK 保留这些字段。
 
 `server.start(mode)` 返回 Promise。HTTP 模式 resolve 为 `{mode:'http', port, host, path}`，且只在真实监听成功后完成；`server.stop()` 也返回 Promise，并等待 HTTP listener 关闭。声明的受支持参数约束在 handler 前检查。
 

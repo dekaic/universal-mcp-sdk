@@ -7,6 +7,25 @@
 
 const { textContent, errorContent } = require('./content');
 
+// Only infer bare content when every block has a known type and its required fields.
+function isContentBlock(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    switch (value.type) {
+        case 'text': return typeof value.text === 'string';
+        case 'image':
+        case 'audio': return typeof value.data === 'string' && typeof value.mimeType === 'string';
+        case 'resource_link': return typeof value.uri === 'string' && typeof value.name === 'string';
+        case 'resource': {
+            const resource = value.resource;
+            return !!resource && typeof resource === 'object' && !Array.isArray(resource) &&
+                typeof resource.uri === 'string' &&
+                (typeof resource.text === 'string' || typeof resource.blob === 'string');
+        }
+        default: return false;
+    }
+}
+
+
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 const SUPPORTED_PROTOCOL_VERSIONS = ['2025-03-26', '2025-06-18'];
 
@@ -94,8 +113,8 @@ function createDispatcher(options) {
     function wrapContent(result) {
         if (result === undefined || result === null) return [textContent('(ok)')];
         if (typeof result === 'string') return [textContent(result)];
-        if (Array.isArray(result) && result[0] && result[0].type) return result;
-        if (result && result.type && result.text !== undefined) return [result];
+        if (Array.isArray(result) && result.length > 0 && result.every(isContentBlock)) return result;
+        if (result && result.text !== undefined && isContentBlock(result)) return [result];
         return [textContent(JSON.stringify(result, null, 2))];
     }
 
